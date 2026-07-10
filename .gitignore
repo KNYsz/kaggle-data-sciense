@@ -11,3 +11,4 @@ reports/
 experiments/*.csv
 experiments/*.json
 experiments/*.png
+.kaggle/

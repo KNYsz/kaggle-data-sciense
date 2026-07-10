@@ -42,6 +42,15 @@ BASE_FEATURES = [
     "store_dow_mean",
 ]
 
+LAG_FEATURES = [
+    "sales_lag_1",
+    "sales_lag_7",
+    "sales_lag_14",
+    "sales_roll_mean_7",
+]
+
+MODEL_FEATURES = BASE_FEATURES + LAG_FEATURES
+
 
 @dataclass(frozen=True)
 class DataBundle:
@@ -92,7 +101,8 @@ def encode_categories(frame: pd.DataFrame, mappings: dict[str, dict[str, int]] |
         if column not in mappings:
             values = pd.Index(frame[column].astype(str).fillna("__missing__").unique()).sort_values()
             mappings[column] = {value: index for index, value in enumerate(values)}
-        frame[f"{column}_enc"] = frame[column].astype(str).fillna("__missing__").map(mappings[column]).astype("int32")
+        encoded = frame[column].astype(str).fillna("__missing__").map(mappings[column]).fillna(-1)
+        frame[f"{column}_enc"] = encoded.astype("int32")
     return frame, mappings
 
 
@@ -154,6 +164,16 @@ def add_time_features(frame: pd.DataFrame, bundle: DataBundle) -> pd.DataFrame:
     return merged
 
 
+def add_lag_features(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.sort_values(["store_nbr", "family", "date"]).copy()
+    grouped_sales = frame.groupby(["store_nbr", "family"], sort=False)["sales"]
+    frame["sales_lag_1"] = grouped_sales.shift(1)
+    frame["sales_lag_7"] = grouped_sales.shift(7)
+    frame["sales_lag_14"] = grouped_sales.shift(14)
+    frame["sales_roll_mean_7"] = grouped_sales.transform(lambda series: series.shift(1).rolling(7).mean())
+    return frame
+
+
 def rmsle(y_true: np.ndarray | pd.Series, y_pred: np.ndarray | pd.Series) -> float:
     return float(np.sqrt(mean_squared_log_error(np.clip(y_true, 0, None), np.clip(y_pred, 0, None))))
 
@@ -187,20 +207,16 @@ def make_holdout_split(frame: pd.DataFrame, validation_start: pd.Timestamp = VAL
 def train_xgb_model(train_frame: pd.DataFrame, valid_frame: pd.DataFrame | None = None, seed: int = 42) -> XGBRegressor:
     train_features, encoders = encode_categories(train_frame)
     train_features = apply_target_encodings(train_features, build_target_encodings(train_features))
+    train_features = add_lag_features(train_features)
+    train_features = train_features.loc[train_features["date"] >= pd.Timestamp("2016-01-01")].dropna(subset=LAG_FEATURES)
 
-    x_train = train_features[BASE_FEATURES]
+    x_train = train_features[MODEL_FEATURES]
     y_train = np.log1p(train_features["sales"].astype(float))
 
-    eval_set = None
-    if valid_frame is not None:
-        valid_features, _ = encode_categories(valid_frame, encoders)
-        valid_features = apply_target_encodings(valid_features, build_target_encodings(train_features))
-        eval_set = [(valid_features[BASE_FEATURES], np.log1p(valid_features["sales"].astype(float)))]
-
     model = XGBRegressor(
-        n_estimators=800,
-        learning_rate=0.03,
-        max_depth=8,
+        n_estimators=600,
+        learning_rate=0.05,
+        max_depth=7,
         subsample=0.8,
         colsample_bytree=0.8,
         min_child_weight=5,
@@ -210,23 +226,104 @@ def train_xgb_model(train_frame: pd.DataFrame, valid_frame: pd.DataFrame | None 
         tree_method="hist",
         objective="reg:squarederror",
     )
-    model.fit(x_train, y_train, eval_set=eval_set, verbose=False)
+    model.fit(x_train, y_train, verbose=False)
     return model
 
 
 def fit_predict_xgb(train_frame: pd.DataFrame, valid_frame: pd.DataFrame, test_frame: pd.DataFrame, seed: int = 42) -> tuple[XGBRegressor, np.ndarray, np.ndarray]:
-    model = train_xgb_model(train_frame, valid_frame=valid_frame, seed=seed)
-
     train_features, encoders = encode_categories(train_frame)
     encodings = build_target_encodings(train_features)
+
+    model_train = apply_target_encodings(train_features.copy(), encodings)
+    model_train = add_lag_features(model_train)
+    model_train = model_train.loc[model_train["date"] >= pd.Timestamp("2016-01-01")].dropna(subset=LAG_FEATURES)
+
+    x_train = model_train[MODEL_FEATURES]
+    y_train = np.log1p(model_train["sales"].astype(float))
+
+    model = XGBRegressor(
+        n_estimators=600,
+        learning_rate=0.05,
+        max_depth=7,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        random_state=seed,
+        tree_method="hist",
+        objective="reg:squarederror",
+    )
+    model.fit(x_train, y_train, verbose=False)
+
     valid_features, _ = encode_categories(valid_frame, encoders)
     valid_features = apply_target_encodings(valid_features, encodings)
+    valid_features = recursive_lag_forecast(model, model_train, valid_features, seed=seed)
+
     test_features, _ = encode_categories(test_frame, encoders)
     test_features = apply_target_encodings(test_features, encodings)
+    test_features = recursive_lag_forecast(model, model_train, test_features, seed=seed)
 
-    valid_pred = np.clip(np.expm1(model.predict(valid_features[BASE_FEATURES])), 0, None)
-    test_pred = np.clip(np.expm1(model.predict(test_features[BASE_FEATURES])), 0, None)
+    valid_pred = np.clip(np.expm1(model.predict(valid_features[MODEL_FEATURES])), 0, None)
+    test_pred = np.clip(np.expm1(model.predict(test_features[MODEL_FEATURES])), 0, None)
     return model, valid_pred, test_pred
+
+
+def recursive_lag_forecast(
+    model: XGBRegressor,
+    history_frame: pd.DataFrame,
+    future_frame: pd.DataFrame,
+    seed: int = 42,
+) -> pd.DataFrame:
+    history = {
+        (store_nbr, family): group["sales"].astype(float).tolist()
+        for (store_nbr, family), group in history_frame.sort_values(["date", "store_nbr", "family"]).groupby(["store_nbr", "family"], sort=False)
+    }
+
+    future = future_frame.sort_values(["date", "store_nbr", "family"]).copy()
+    future["sales_lag_1"] = np.nan
+    future["sales_lag_7"] = np.nan
+    future["sales_lag_14"] = np.nan
+    future["sales_roll_mean_7"] = np.nan
+
+    predicted_values: list[float] = []
+    for date_value in future["date"].drop_duplicates().sort_values():
+        date_mask = future["date"].eq(date_value)
+        date_rows = future.loc[date_mask].copy()
+
+        lag_1_values = []
+        lag_7_values = []
+        lag_14_values = []
+        roll_mean_values = []
+
+        for _, row in date_rows.iterrows():
+            key = (row["store_nbr"], row["family"])
+            series = history.get(key, [])
+            lag_1 = series[-1] if len(series) >= 1 else 0.0
+            lag_7 = series[-7] if len(series) >= 7 else lag_1
+            lag_14 = series[-14] if len(series) >= 14 else lag_7
+            roll_mean = float(np.mean(series[-7:])) if len(series) >= 7 else float(np.mean(series)) if series else 0.0
+
+            lag_1_values.append(lag_1)
+            lag_7_values.append(lag_7)
+            lag_14_values.append(lag_14)
+            roll_mean_values.append(roll_mean)
+
+        future.loc[date_mask, "sales_lag_1"] = lag_1_values
+        future.loc[date_mask, "sales_lag_7"] = lag_7_values
+        future.loc[date_mask, "sales_lag_14"] = lag_14_values
+        future.loc[date_mask, "sales_roll_mean_7"] = roll_mean_values
+
+        predictions = np.clip(np.expm1(model.predict(future.loc[date_mask, MODEL_FEATURES])), 0, None)
+        predicted_values.extend(predictions.tolist())
+
+        for (_, row), prediction in zip(date_rows.iterrows(), predictions, strict=False):
+            key = (row["store_nbr"], row["family"])
+            history.setdefault(key, []).append(float(prediction))
+
+    future = future.sort_values(["date", "store_nbr", "family"]).copy()
+    future["forecast_sales"] = predicted_values
+    return future
 
 
 def save_submission(prediction: pd.DataFrame, path: Path) -> Path:
