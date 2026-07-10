@@ -330,3 +330,34 @@ def save_submission(prediction: pd.DataFrame, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     prediction.to_csv(path, index=False)
     return path
+
+
+def hierarchical_mean_predict(train: pd.DataFrame, test: pd.DataFrame) -> pd.DataFrame:
+    train = train.copy()
+    test = test.copy()
+    train["dayofweek"] = train["date"].dt.dayofweek
+    test["dayofweek"] = test["date"].dt.dayofweek
+
+    global_mean = float(train["sales"].mean())
+    mean_sfdp = train.groupby(["store_nbr", "family", "dayofweek", "onpromotion"])["sales"].mean()
+    mean_sfd = train.groupby(["store_nbr", "family", "dayofweek"])["sales"].mean()
+    mean_sf = train.groupby(["store_nbr", "family"])["sales"].mean()
+    mean_fd = train.groupby(["family", "dayofweek"])["sales"].mean()
+    mean_d = train.groupby("dayofweek")["sales"].mean()
+
+    predictions = []
+    for row in test.itertuples(index=False):
+        key_sfdp = (row.store_nbr, row.family, row.dayofweek, row.onpromotion)
+        key_sfd = (row.store_nbr, row.family, row.dayofweek)
+        key_sf = (row.store_nbr, row.family)
+        key_fd = (row.family, row.dayofweek)
+        prediction = mean_sfdp.get(
+            key_sfdp,
+            mean_sfd.get(
+                key_sfd,
+                mean_sf.get(key_sf, mean_fd.get(key_fd, mean_d.get(row.dayofweek, global_mean))),
+            ),
+        )
+        predictions.append(max(float(prediction), 0.0))
+
+    return pd.DataFrame({"id": test["id"], "sales": predictions})

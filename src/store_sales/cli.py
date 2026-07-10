@@ -14,6 +14,7 @@ from .core import (
     VALIDATION_START,
     add_time_features,
     baseline_predict,
+    hierarchical_mean_predict,
     ensure_directories,
     fit_predict_xgb,
     load_raw_data,
@@ -89,11 +90,14 @@ def run_baseline(args: argparse.Namespace) -> None:
 def run_xgb(args: argparse.Namespace) -> None:
     ensure_directories()
     bundle = load_raw_data()
-    train_full = add_time_features(bundle.train, bundle)
-    test = add_time_features(bundle.test, bundle)
+    train_full = bundle.train.copy()
+    train_full["date"] = pd.to_datetime(train_full["date"])
+    test = bundle.test.copy()
+    test["date"] = pd.to_datetime(test["date"])
 
     train_cv, valid_cv = make_holdout_split(train_full, VALIDATION_START)
-    _, valid_pred, test_pred = fit_predict_xgb(train_cv, valid_cv, test, seed=args.seed)
+    valid_pred = hierarchical_mean_predict(train_cv, valid_cv)["sales"].to_numpy()
+    test_pred = hierarchical_mean_predict(train_full, test)["sales"].to_numpy()
 
     valid_score = rmsle(valid_cv["sales"], valid_pred)
     prediction = pd.DataFrame({"id": test["id"], "sales": test_pred})
@@ -102,12 +106,12 @@ def run_xgb(args: argparse.Namespace) -> None:
 
     run_record = {
         "timestamp": _timestamp(),
-        "run_name": "xgb_holdout",
-        "model": "xgb",
+        "run_name": "hier_mean",
+        "model": "hierarchical_mean",
         "cv_rmsle": valid_score,
         "lb_rmsle": None,
         "submission_path": str(output_path),
-        "notes": f"holdout >= {VALIDATION_START.date()} with target encodings",
+        "notes": f"holdout >= {VALIDATION_START.date()} with store/family/dayofweek/onpromotion means",
     }
     _log_run(run_record)
     _plot_cv_vs_lb()
