@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/store_sales/__init__.py
+src/store_sales/cli.py
+src/store_sales/core.py
+src/store_sales_99.egg-info/PKG-INFO
+src/store_sales_99.egg-info/SOURCES.txt
+src/store_sales_99.egg-info/dependency_links.txt
+src/store_sales_99.egg-info/entry_points.txt
+src/store_sales_99.egg-info/requires.txt
+src/store_sales_99.egg-info/top_level.txt

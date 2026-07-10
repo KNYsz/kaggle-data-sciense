@@ -1,0 +1,1 @@
+"""Store Sales competition utilities."""

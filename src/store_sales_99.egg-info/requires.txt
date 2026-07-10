@@ -1,0 +1,8 @@
+kaggle>=1.6.17
+matplotlib>=3.9
+numpy>=2.2
+pandas>=2.2
+scikit-learn>=1.5
+seaborn>=0.13
+statsmodels>=0.14
+xgboost>=2.1
